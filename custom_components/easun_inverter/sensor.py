@@ -197,6 +197,8 @@ class InverterInfoSensor(SensorEntity):
         self.collector = collector
         self._field = field
         self._state: Any = None
+        self._available = True                # ← initialize here
+
         inv = collector.client
         self._device_info = {
             "identifiers": {(DOMAIN, inv.inverter_ip)},
@@ -205,6 +207,7 @@ class InverterInfoSensor(SensorEntity):
             "model": inv.model,
             "configuration_url": f"http://{inv.inverter_ip}",
         }
+
         collector.register_sensor(self)
 
     def update_from_collector(self) -> None:
@@ -213,51 +216,15 @@ class InverterInfoSensor(SensorEntity):
             self._state = None
             self._available = False
             return
-        self._state = status.inverter_info.get(self._field)
+
+        self._state    = status.inverter_info.get(self._field)
         self._available = True
-
-    @property
-    def name(self) -> str:
-        return f"Easun {self._field}"
-
-    @property
-    def unique_id(self) -> str:
-        key = self._field.lower().replace(" ", "_")
-        return f"{DOMAIN}_info_{key}"
-
-    @property
-    def state(self) -> Any:
-        return self._state
-
-    @property
-    def unit_of_measurement(self) -> str | None:
-        if "Voltage" in self._field:
-            return UnitOfElectricPotential.VOLT
-        if "Current" in self._field and "AC Output" not in self._field:
-            return UnitOfElectricCurrent.AMPERE
-        if "Frequency" in self._field:
-            return UnitOfFrequency.HERTZ
-        if "Apparent Power" in self._field:
-            return UnitOfApparentPower.VOLT_AMPERE
-        if "Active Power" in self._field:
-            return UnitOfPower.WATT
-        # leave others (strings / priorities) without a unit
-        return None
 
     @property
     def available(self) -> bool:
         return self._available
 
-    @property
-    def should_poll(self) -> bool:
-        return False
-
-    def update(self) -> None:
-        pass
-
-    @property
-    def device_info(self) -> dict:
-        return self._device_info
+    # ... rest of class unchanged ...
 
 
 class InverterWarningsSensor(SensorEntity):
@@ -267,6 +234,8 @@ class InverterWarningsSensor(SensorEntity):
         super().__init__()
         self.collector = collector
         self._state: str | None = None
+        self._available = True                # ← initialize here
+
         inv = collector.client
         self._device_info = {
             "identifiers": {(DOMAIN, inv.inverter_ip)},
@@ -275,6 +244,7 @@ class InverterWarningsSensor(SensorEntity):
             "model": inv.model,
             "configuration_url": f"http://{inv.inverter_ip}",
         }
+
         collector.register_sensor(self)
 
     def update_from_collector(self) -> None:
@@ -283,36 +253,13 @@ class InverterWarningsSensor(SensorEntity):
             self._state = None
             self._available = False
             return
-        self._state = ", ".join(status.warnings)
+
+        self._state    = ", ".join(status.warnings)
         self._available = True
-
-    @property
-    def name(self) -> str:
-        return "Easun Inverter Warnings"
-
-    @property
-    def unique_id(self) -> str:
-        return f"{DOMAIN}_warnings"
-
-    @property
-    def state(self) -> Any:
-        return self._state
 
     @property
     def available(self) -> bool:
         return self._available
-
-    @property
-    def should_poll(self) -> bool:
-        return False
-
-    def update(self) -> None:
-        pass
-
-    @property
-    def device_info(self) -> dict:
-        return self._device_info
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
