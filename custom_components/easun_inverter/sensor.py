@@ -1,6 +1,6 @@
 # File: custom_components/easun_inverter/sensor.py
 
-"""Support for Easun Inverter sensors, including dynamic QPIRI and QPIWS sensors grouped under one device."""
+"""All Easun sensors grouped under one device, static and dynamic (QPIRI/QPIWS)."""
 from __future__ import annotations
 import asyncio
 import logging
@@ -9,13 +9,13 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import (
-    PERCENTAGE,
     UnitOfElectricPotential,
     UnitOfElectricCurrent,
     UnitOfPower,
     UnitOfApparentPower,
     UnitOfFrequency,
     UnitOfTemperature,
+    PERCENTAGE,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
@@ -29,12 +29,10 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Any model key that ends with SMW_8K or SMW_11K uses ASCII protocol
-ASCII_MODELS = {
-    key for key in MODEL_CONFIGS if key.endswith("SMW_8K") or key.endswith("SMW_11K")
-}
+# Route any model ending in SMW_8K/11K to ASCII
+ASCII_MODELS = {m for m in MODEL_CONFIGS if m.endswith("SMW_8K") or m.endswith("SMW_11K")}
 
-# Friendly names for QPIRI fields as returned in SystemStatus.inverter_info
+# Friendly names for QPIRI
 QPIRI_FIELDS = [
     "Grid Rating Voltage",
     "Grid Rating Current",
@@ -65,15 +63,11 @@ QPIRI_FIELDS = [
     "Max Discharging Current",
 ]
 
-
 class DataCollector:
-    """Fetches all data in one go, then fans it out to sensors."""
-
     def __init__(self, client: AsyncISolar | AsyncAsciiISolar) -> None:
         self.client = client
         self._data: dict[str, Any] = {}
         self._lock = asyncio.Lock()
-        self._last_success: datetime | None = None
         self._sensors: list[SensorEntity] = []
         _LOGGER.info(f"DataCollector initialized with model {client.model}")
 
@@ -81,11 +75,8 @@ class DataCollector:
         self._sensors.append(sensor)
 
     async def update_data(self) -> None:
-        """One big bulk fetch, then push to each sensor."""
         if self._lock.locked():
-            _LOGGER.debug("Update in progress, skipping this cycle.")
             return
-
         await self._lock.acquire()
         try:
             battery, pv, grid, output, status = await self.client.get_all_data()
@@ -96,10 +87,8 @@ class DataCollector:
                 "output": output,
                 "system": status,
             }
-            self._last_success = datetime.utcnow()
-            # fan out
-            for sensor in self._sensors:
-                sensor.update_from_collector()
+            for s in self._sensors:
+                s.update_from_collector()
         except Exception as e:
             _LOGGER.error("Failed to fetch Easun data: %s", e)
         finally:
@@ -108,10 +97,7 @@ class DataCollector:
     def get_data(self, key: str) -> Any:
         return self._data.get(key)
 
-
 class EasunSensor(SensorEntity):
-    """Static sensors for battery / pv / grid / output / system."""
-
     def __init__(
         self,
         collector: DataCollector,
@@ -120,7 +106,7 @@ class EasunSensor(SensorEntity):
         unit: str | None,
         data_type: str,
         data_attr: str,
-        converter: callable | None = None,
+        conv: callable | None = None,
     ) -> None:
         super().__init__()
         self.collector = collector
@@ -129,7 +115,7 @@ class EasunSensor(SensorEntity):
         self._unit = unit
         self._data_type = data_type
         self._data_attr = data_attr
-        self._converter = converter
+        self._conv = conv
         self._state: Any = None
         self._available = True
 
@@ -141,7 +127,6 @@ class EasunSensor(SensorEntity):
             "model": inv.model,
             "configuration_url": f"http://{inv.inverter_ip}",
         }
-
         collector.register_sensor(self)
 
     def update_from_collector(self) -> None:
@@ -150,12 +135,11 @@ class EasunSensor(SensorEntity):
             self._available = False
             return
         val = getattr(data, self._data_attr)
-        if self._converter:
-            val = self._converter(val)
+        if self._conv:
+            val = self._conv(val)
         self._state = val
         self._available = True
 
-    # required SensorEntity overrides:
     @property
     def name(self) -> str:
         return f"Easun {self._name}"
@@ -181,23 +165,19 @@ class EasunSensor(SensorEntity):
         return False
 
     def update(self) -> None:
-        """No polling: we push updates via the DataCollector."""
         pass
 
     @property
     def device_info(self) -> dict:
         return self._device_info
 
-
 class InverterInfoSensor(SensorEntity):
-    """One sensor per QPIRI field, numeric‐valued ones get proper units."""
-
     def __init__(self, collector: DataCollector, field: str) -> None:
         super().__init__()
         self.collector = collector
         self._field = field
         self._state: Any = None
-        self._available = True                # ← initialize here
+        self._available = True
 
         inv = collector.client
         self._device_info = {
@@ -207,7 +187,6 @@ class InverterInfoSensor(SensorEntity):
             "model": inv.model,
             "configuration_url": f"http://{inv.inverter_ip}",
         }
-
         collector.register_sensor(self)
 
     def update_from_collector(self) -> None:
@@ -216,25 +195,57 @@ class InverterInfoSensor(SensorEntity):
             self._state = None
             self._available = False
             return
-
-        self._state    = status.inverter_info.get(self._field)
+        self._state = status.inverter_info.get(self._field)
         self._available = True
+
+    @property
+    def name(self) -> str:
+        return f"Easun {self._field}"
+
+    @property
+    def unique_id(self) -> str:
+        key = self._field.lower().replace(" ", "_")
+        return f"{DOMAIN}_info_{key}"
+
+    @property
+    def state(self) -> Any:
+        return self._state
+
+    @property
+    def unit_of_measurement(self) -> str | None:
+        if "Voltage" in self._field:
+            return UnitOfElectricPotential.VOLT
+        if "Current" in self._field and "AC Output" not in self._field:
+            return UnitOfElectricCurrent.AMPERE
+        if "Frequency" in self._field:
+            return UnitOfFrequency.HERTZ
+        if "Apparent Power" in self._field:
+            return UnitOfApparentPower.VOLT_AMPERE
+        if "Active Power" in self._field:
+            return UnitOfPower.WATT
+        return None
 
     @property
     def available(self) -> bool:
         return self._available
 
-    # ... rest of class unchanged ...
+    @property
+    def should_poll(self) -> bool:
+        return False
 
+    def update(self) -> None:
+        pass
+
+    @property
+    def device_info(self) -> dict:
+        return self._device_info
 
 class InverterWarningsSensor(SensorEntity):
-    """QPIWS warnings bitmask as a comma-separated string."""
-
     def __init__(self, collector: DataCollector) -> None:
         super().__init__()
         self.collector = collector
-        self._state: str | None = None
-        self._available = True                # ← initialize here
+        self._state: Any = None
+        self._available = True
 
         inv = collector.client
         self._device_info = {
@@ -244,7 +255,6 @@ class InverterWarningsSensor(SensorEntity):
             "model": inv.model,
             "configuration_url": f"http://{inv.inverter_ip}",
         }
-
         collector.register_sensor(self)
 
     def update_from_collector(self) -> None:
@@ -253,34 +263,51 @@ class InverterWarningsSensor(SensorEntity):
             self._state = None
             self._available = False
             return
-
-        self._state    = ", ".join(status.warnings)
+        self._state = ", ".join(status.warnings)
         self._available = True
+
+    @property
+    def name(self) -> str:
+        return "Easun Inverter Warnings"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{DOMAIN}_warnings"
+
+    @property
+    def state(self) -> Any:
+        return self._state
 
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def should_poll(self) -> bool:
+        return False
+
+    def update(self) -> None:
+        pass
+
+    @property
+    def device_info(self) -> dict:
+        return self._device_info
 
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Easun Inverter sensors."""
     _LOGGER.debug("Setting up Easun Inverter sensors")
-
-    scan_interval = config_entry.options.get(
-        "scan_interval", config_entry.data.get("scan_interval", 30)
-    )
+    interval = config_entry.options.get("scan_interval", config_entry.data.get("scan_interval", 30))
     inv_ip = config_entry.data.get("inverter_ip")
     local_ip = config_entry.data.get("local_ip")
-    model = config_entry.data.get("model")
+    model  = config_entry.data.get("model")
 
     if not inv_ip or not local_ip:
         _LOGGER.error("Missing inverter_ip or local_ip")
         return
 
-    # pick the right client
     if model in ASCII_MODELS:
         client = AsyncAsciiISolar(inverter_ip=inv_ip, local_ip=local_ip, model=model)
     else:
@@ -289,7 +316,6 @@ async def async_setup_entry(
     collector = DataCollector(client)
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = collector
 
-    # build static sensors
     def freq(v): return v / 100 if v is not None else None
 
     entities: list[SensorEntity] = [
@@ -319,17 +345,13 @@ async def async_setup_entry(
 
     # dynamic QPIRI/QPIWS for ASCII models
     if model in ASCII_MODELS:
-        for field in QPIRI_FIELDS:
-            entities.append(InverterInfoSensor(collector, field))
+        for f in QPIRI_FIELDS:
+            entities.append(InverterInfoSensor(collector, f))
         entities.append(InverterWarningsSensor(collector))
 
     add_entities(entities, True)
 
-    # schedule the periodic update
     async def _update(now):
-        try:
-            await collector.update_data()
-        except Exception as e:
-            _LOGGER.error("Scheduled update failed: %s", e)
+        await collector.update_data()
 
-    async_track_time_interval(hass, _update, timedelta(seconds=scan_interval))
+    async_track_time_interval(hass, _update, timedelta(seconds=interval))
