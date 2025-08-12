@@ -7,7 +7,7 @@ from datetime import datetime
 from .models import BatteryData, PVData, GridData, OutputData, SystemStatus
 
 class AsyncAsciiISolar:
-    """Async client for EASUN ASCII‐protocol inverters (QPIGS/QPIRI/etc)."""
+    """Async client for EASUN ASCII‐protocol inverters (QPIGS/QPIRI/QMOD/QPIWS/QPIGS2)."""
 
     ASCII_MODELS = {"EASUN_SMW_8K", "EASUN_SMW_11K"}
 
@@ -38,26 +38,24 @@ class AsyncAsciiISolar:
         return crc
 
     def _adjust_crc_byte(self, byte: int) -> int:
-        # avoid reserved chars: 0x0A, 0x0D, 0x28
         if byte in (0x0A, 0x0D, 0x28):
             return (byte + 1) & 0xFF
         return byte
 
     def _build_packet(self, command: str, trans_id: int) -> bytes:
-        cmd_bytes = command.encode("ascii")
-        crc = self._compute_crc_xmodem(cmd_bytes)
-        high = self._adjust_crc_byte((crc >> 8) & 0xFF)
-        low = self._adjust_crc_byte(crc & 0xFF)
-        data = cmd_bytes + bytes([high, low, 0x0D])
-        length = len(data) + 2
-        header = bytes([
+        cmd = command.encode("ascii")
+        crc = self._compute_crc_xmodem(cmd)
+        hi = self._adjust_crc_byte((crc >> 8) & 0xFF)
+        lo = self._adjust_crc_byte(crc & 0xFF)
+        payload = cmd + bytes([hi, lo, 0x0D])
+        length = len(payload) + 2
+        hdr = bytes([
             (trans_id >> 8) & 0xFF, trans_id & 0xFF,
             0x00, 0x01,
             (length >> 8) & 0xFF, length & 0xFF,
-            0xFF,
-            0x04
+            0xFF, 0x04
         ])
-        return header + data
+        return hdr + payload
 
     async def _start_server_and_discover(self):
         # UDP discovery
@@ -67,15 +65,13 @@ class AsyncAsciiISolar:
 
         # start TCP listener
         self._server = await asyncio.start_server(
-            self._handle_client,
-            host=self.local_ip,
-            port=self.server_port
+            self._handle_client, host=self.local_ip, port=self.server_port
         )
-        self.logger.debug(f"Listening for inverter TCP on {self.local_ip}:{self.server_port}")
+        self.logger.debug(f"Listening on {self.local_ip}:{self.server_port}")
         while self._reader is None:
             await asyncio.sleep(0.1)
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def _handle_client(self, reader, writer):
         if self._reader is None:
             self._reader = reader
             self._writer = writer
@@ -89,58 +85,51 @@ class AsyncAsciiISolar:
             if not self._reader:
                 await self._start_server_and_discover()
 
-    async def _send_command(self, command: str) -> str:
+    async def _send_command(self, cmd: str) -> str:
         await self._ensure_connection()
-        packet = self._build_packet(command, self._trans_id)
+        pkt = self._build_packet(cmd, self._trans_id)
         self._trans_id = (self._trans_id + 1) & 0xFFFF
-
         assert self._writer is not None
-        self._writer.write(packet)
+        self._writer.write(pkt)
         await self._writer.drain()
 
-        # read Modbus‐style header
-        header = await asyncio.wait_for(self._reader.readexactly(6), timeout=5)
-        length = int.from_bytes(header[4:6], "big")
-        payload = await asyncio.wait_for(self._reader.readexactly(length), timeout=5)
+        hdr = await asyncio.wait_for(self._reader.readexactly(6), timeout=5)
+        length = int.from_bytes(hdr[4:6], "big")
+        data = await asyncio.wait_for(self._reader.readexactly(length), timeout=5)
+        raw = data[:-3].decode("ascii", errors="ignore")
 
-        # decode ASCII, drop CRC (2 bytes) + CR
-        raw = payload[:-3].decode("ascii", errors="ignore")
-
-        # strip any leading garbage up to the first '('
+        # strip any leading garbage up to '('
         idx = raw.find('(')
-        if idx != -1:
-            raw = raw[idx:]
-        raw = raw.strip()
-
-        self.logger.debug(f"Raw response for {command}: {raw!r}")
+        raw = raw[idx:].strip() if idx != -1 else raw.strip()
+        self.logger.debug(f"Raw {cmd}: {raw!r}")
         return raw
 
     def _parse_qpigs(self, raw: str) -> dict:
-        fields = raw.strip("()").split()
+        f = raw.strip("()").split()
         return {
-            "grid_voltage":      float(fields[0]),
-            "grid_frequency":    float(fields[1]),
-            "output_voltage":    float(fields[2]),
-            "output_frequency":  float(fields[3]),
-            "apparent_power":    int(float(fields[4])),
-            "active_power":      int(float(fields[5])),
-            "load_percent":      int(fields[6]),
-            "bus_voltage":       float(fields[7]),
-            "battery_voltage":   float(fields[8]),
-            "battery_current":   float(fields[9]),
-            "battery_soc":       int(fields[10]),
-            "battery_temp":      int(float(fields[11])),
-            "pv_current":        float(fields[12]),
-            "pv_voltage":        float(fields[13]),
-            "pv_charge_power":   int(float(fields[19])),
+            "grid_voltage":     float(f[0]),
+            "grid_frequency":   float(f[1]),
+            "output_voltage":   float(f[2]),
+            "output_frequency": float(f[3]),
+            "apparent_power":   int(float(f[4])),
+            "active_power":     int(float(f[5])),
+            "load_percent":     int(f[6]),
+            "bus_voltage":      float(f[7]),
+            "battery_voltage":  float(f[8]),
+            "battery_current":  float(f[9]),
+            "battery_soc":      int(f[10]),
+            "battery_temp":     int(float(f[11])),
+            "pv_current":       float(f[12]),
+            "pv_voltage":       float(f[13]),
+            "pv_charge_power":  int(float(f[19])),
         }
 
     def _parse_qpigs2(self, raw: str) -> dict:
-        fields = raw.strip("()").split()
+        f = raw.strip("()").split()
         return {
-            "pv2_current": float(fields[0]),
-            "pv2_voltage": float(fields[1]),
-            "pv2_power":   int(float(fields[2])),
+            "pv2_current": float(f[0]),
+            "pv2_voltage": float(f[1]),
+            "pv2_power":   int(float(f[2])),
         }
 
     def _parse_qmod(self, raw: str) -> str:
@@ -152,18 +141,107 @@ class AsyncAsciiISolar:
             "B": "Battery Mode",
             "F": "Fault Mode",
             "H": "Power Saving Mode",
-        }.get(code, f"Unknown Mode: {code}")
+        }.get(code, code)
 
-    async def get_all_data(
-        self
-    ) -> tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
-        """Poll all ASCII commands and assemble dataclasses."""
-        responses = {}
+    def _parse_qpiri(self, raw: str) -> dict:
+        """Device rating info with friendly names."""
+        f = raw.strip("()").split()
+        if len(f) < 27:
+            return {"error": "Invalid QPIRI response"}
+        # helpers
+        btype = {"0": "AGM", "1": "Flooded", "2": "User"}.get(f[12], f[12])
+        irange = {"0": "Appliance", "1": "UPS"}.get(f[15], f[15])
+        osp    = {"0": "UtilitySolarBat", "1": "SolarUtilityBat", "2": "SolarBatUtility"}.get(f[16], f[16])
+        csp    = {"1": "Solar first", "2": "Solar + Utility", "3": "Only solar charging permitted"}.get(f[17], f[17])
+        mtype  = {"00": "Grid tie", "01": "Off Grid", "10": "Hybrid"}.get(f[19], f[19])
+        topo   = {"0": "transformerless", "1": "transformer"}.get(f[20], f[20])
+        omode  = {
+            "00": "single machine output", "01": "parallel output",
+            "02": "Phase 1 of 3 Phase output", "03": "Phase 2 of 3 Phase output",
+            "04": "Phase 3 of 3 Phase output", "05": "Phase 1 of 2 Phase output",
+            "06": "Phase 2 of 2 Phase output (120°)", "07": "Phase 2 of 2 Phase output (180°)",
+        }.get(f[21], f[21])
+
+        return {
+            "Grid Rating Voltage":         f"{f[0]} V",
+            "Grid Rating Current":         f"{f[1]} A",
+            "AC Output Rating Voltage":    f"{f[2]} V",
+            "AC Output Rating Frequency":  f"{f[3]} Hz",
+            "AC Output Rating Current":    f"{f[4]} A",
+            "AC Output Rating Apparent Power": f"{f[5]} VA",
+            "AC Output Rating Active Power":   f"{f[6]} W",
+            "Battery Rating Voltage":      f"{f[7]} V",
+            "Battery Re-Charge Voltage":   f"{f[8]} V",
+            "Battery Under Voltage":       f"{f[9]} V",
+            "Battery Bulk Voltage":        f"{f[10]} V",
+            "Battery Float Voltage":       f"{f[11]} V",
+            "Battery Type":                btype,
+            "Max AC Charging Current":     f"{f[13]} A",
+            "Max Charging Current":        f"{f[14]} A",
+            "Input Voltage Range":         irange,
+            "Output Source Priority":      osp,
+            "Charger Source Priority":     csp,
+            "Parallel Max Num":            f[18],
+            "Machine Type":                mtype,
+            "Topology":                    topo,
+            "Output Mode":                 omode,
+            "Battery Re-Discharge Voltage": f"{f[22]} V",
+            "PV OK Condition":             f[23],
+            "PV Power Balance":            f"{f[24]}",
+            "Max Charging Time at CV Stage": f"{f[25]} min",
+            "Max Discharging Current":      f"{f[26]} A",
+        }
+
+    def _parse_qpiws(self, raw: str) -> list[str]:
+        """Parse bitwise warnings and return list of friendly strings."""
+        bits = list(raw.strip("()"))
+        if len(bits) < 32:
+            return ["Invalid QPIWS response"]
+        warn_map = {
+            0:  "Reserved",
+            1:  "Inverter fault",
+            2:  "Bus over",
+            3:  "Bus under",
+            4:  "Bus soft fail",
+            5:  "Line fail",
+            6:  "OPV short",
+            7:  "Inverter voltage low",
+            8:  "Inverter voltage high",
+            9:  "Inverter soft fail",
+            10: "Inverter over current",
+            11: "Inverter over load",
+            12: "Inverter over temperature",
+            13: "Fan locked",
+            14: "Battery voltage high",
+            15: "Battery low alarm",
+            17: "Battery under shutdown",
+            19: "Over load",
+            20: "EEPROM fault",
+            21: "Inverter over current",
+            22: "Inverter soft fail",
+            23: "Self test fail",
+            24: "OP DC voltage over",
+            25: "Battery open",
+            26: "Current sensor fail",
+            27: "Battery short",
+            28: "Power limit",
+            29: "PV voltage high",
+            30: "MPPT overload fault",
+            31: "MPPT overload warning",
+            32: "Battery too low to charge",
+        }
+        warnings = [name for idx, name in warn_map.items()
+                    if idx < len(bits) and bits[idx] == '1']
+        return warnings or ["No warnings"]
+
+    async def get_all_data(self):
+        """Poll all ASCII commands, parse them and return five data classes."""
+        raw = {}
         for cmd in self.commands:
-            responses[cmd] = await self._send_command(cmd)
+            raw[cmd] = await self._send_command(cmd)
             await asyncio.sleep(0.3)
 
-        # close connection
+        # clean up connection
         if self._writer:
             self._writer.close()
             await self._writer.wait_closed()
@@ -171,9 +249,11 @@ class AsyncAsciiISolar:
             self._server.close()
             await self._server.wait_closed()
 
-        p1 = self._parse_qpigs(responses["QPIGS"])
-        p2 = self._parse_qpigs2(responses["QPIGS2"])
-        mode_name = self._parse_qmod(responses["QMOD"])
+        p1 = self._parse_qpigs(raw["QPIGS"])
+        p2 = self._parse_qpigs2(raw["QPIGS2"])
+        mode_name = self._parse_qmod(raw["QMOD"])
+        info = self._parse_qpiri(raw["QPIRI"])
+        warns = self._parse_qpiws(raw["QPIWS"])
 
         battery = BatteryData(
             voltage=p1["battery_voltage"],
@@ -182,7 +262,6 @@ class AsyncAsciiISolar:
             soc=p1["battery_soc"],
             temperature=p1["battery_temp"],
         )
-
         pv = PVData(
             total_power=p1["pv_charge_power"],
             charging_power=p1["pv_charge_power"],
@@ -197,13 +276,11 @@ class AsyncAsciiISolar:
             pv_generated_today=0.0,
             pv_generated_total=0.0,
         )
-
         grid = GridData(
             voltage=p1["grid_voltage"],
             power=p1["active_power"],
             frequency=int(p1["grid_frequency"] * 100),
         )
-
         output = OutputData(
             voltage=p1["output_voltage"],
             current=(p1["active_power"] / p1["output_voltage"] if p1["output_voltage"] else 0.0),
@@ -212,11 +289,12 @@ class AsyncAsciiISolar:
             load_percentage=p1["load_percent"],
             frequency=int(p1["output_frequency"] * 100),
         )
-
         status = SystemStatus(
             operating_mode=None,
             mode_name=mode_name,
             inverter_time=datetime.utcnow(),
+            inverter_info=info,
+            warnings=warns,
         )
 
         return battery, pv, grid, output, status
