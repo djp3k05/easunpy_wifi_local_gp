@@ -49,7 +49,6 @@ class AsyncAsciiISolar:
         high = self._adjust_crc_byte((crc >> 8) & 0xFF)
         low = self._adjust_crc_byte(crc & 0xFF)
         data = cmd_bytes + bytes([high, low, 0x0D])
-        # length = data length + 2 (unit + function)
         length = len(data) + 2
         header = bytes([
             (trans_id >> 8) & 0xFF, trans_id & 0xFF,  # Trans ID
@@ -73,7 +72,6 @@ class AsyncAsciiISolar:
             port=self.server_port
         )
         self.logger.debug(f"Listening for inverter TCP on {self.local_ip}:{self.server_port}")
-        # wait until inverter connects back
         while self._reader is None:
             await asyncio.sleep(0.1)
 
@@ -100,11 +98,9 @@ class AsyncAsciiISolar:
         self._writer.write(packet)
         await self._writer.drain()
 
-        # read Modbus‐style header
         header = await asyncio.wait_for(self._reader.readexactly(6), timeout=5)
         length = int.from_bytes(header[4:6], "big")
         payload = await asyncio.wait_for(self._reader.readexactly(length), timeout=5)
-        # strip CRC (2 bytes) + CR
         raw = payload[:-3].decode("ascii", errors="ignore")
         return raw
 
@@ -151,14 +147,12 @@ class AsyncAsciiISolar:
         self
     ) -> tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
         """Poll all ASCII commands and assemble dataclasses."""
-        # fire off each command
         r = {}
         for cmd in self.commands:
             raw = await self._send_command(cmd)
             r[cmd] = raw
             await asyncio.sleep(0.5)
 
-        # close after polling
         if self._writer:
             self._writer.close()
             await self._writer.wait_closed()
@@ -166,65 +160,48 @@ class AsyncAsciiISolar:
             self._server.close()
             await self._server.wait_closed()
 
-        # parse
         p1 = self._parse_qpigs(r["QPIGS"])
         p2 = self._parse_qpigs2(r["QPIGS2"])
         mode_name = self._parse_qmod(r["QMOD"])
 
-        # BatteryData
-        bat_voltage = p1["battery_voltage"]
-        bat_current = p1["battery_current"]
         battery = BatteryData(
-            voltage=bat_voltage,
-            current=bat_current,
-            power=int(bat_voltage * bat_current),
+            voltage=p1["battery_voltage"],
+            current=p1["battery_current"],
+            power=int(p1["battery_voltage"] * p1["battery_current"]),
             soc=p1["battery_soc"],
             temperature=p1["battery_temp"],
         )
 
-        # PVData
-        pv1_v = p1["pv_voltage"]
-        pv1_i = p1["pv_current"]
-        pv2_v = p2["pv2_voltage"]
-        pv2_i = p2["pv2_current"]
         pv = PVData(
             total_power=p1["pv_charge_power"],
             charging_power=p1["pv_charge_power"],
             charging_current=p1["pv_current"],
-            temperature=0.0,  # not provided
-            pv1_voltage=pv1_v,
-            pv1_current=pv1_i,
-            pv1_power=int(pv1_v * pv1_i),
-            pv2_voltage=pv2_v,
-            pv2_current=pv2_i,
+            temperature=0.0,
+            pv1_voltage=p1["pv_voltage"],
+            pv1_current=p1["pv_current"],
+            pv1_power=int(p1["pv_voltage"] * p1["pv_current"]),
+            pv2_voltage=p2["pv2_voltage"],
+            pv2_current=p2["pv2_current"],
             pv2_power=p2["pv2_power"],
             pv_generated_today=0.0,
             pv_generated_total=0.0,
         )
 
-        # GridData
         grid = GridData(
             voltage=p1["grid_voltage"],
             power=p1["active_power"],
-            frequency=int(p1["grid_frequency"] * 100),  # centi‐Hz for sensor conversion
+            frequency=int(p1["grid_frequency"] * 100),
         )
 
-        # OutputData
-        out_voltage = p1["output_voltage"]
-        out_power = p1["active_power"]
-        out_current = (
-            out_power / out_voltage if out_voltage else 0.0
-        )
         output = OutputData(
-            voltage=out_voltage,
-            current=out_current,
-            power=out_power,
+            voltage=p1["output_voltage"],
+            current=(p1["active_power"] / p1["output_voltage"] if p1["output_voltage"] else 0.0),
+            power=p1["active_power"],
             apparent_power=p1["apparent_power"],
             load_percentage=p1["load_percent"],
             frequency=int(p1["output_frequency"] * 100),
         )
 
-        # SystemStatus
         status = SystemStatus(
             operating_mode=None,
             mode_name=mode_name,
