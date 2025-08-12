@@ -28,11 +28,9 @@ from easunpy.models import MODEL_CONFIGS
 
 _LOGGER = logging.getLogger(__name__)
 
-# Treat any model that ends with SMW_8K or SMW_11K as ASCII‐protocol
+# Any model key that ends with SMW_8K or SMW_11K uses ASCII
 ASCII_MODELS = {
-    model_key
-    for model_key in MODEL_CONFIGS
-    if model_key.endswith("SMW_8K") or model_key.endswith("SMW_11K")
+    key for key in MODEL_CONFIGS if key.endswith("SMW_8K") or key.endswith("SMW_11K")
 }
 
 
@@ -51,14 +49,9 @@ class DataCollector:
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
     def register_sensor(self, sensor: SensorEntity):
+        """Register a sensor to be updated when data is refreshed."""
         self._sensors.append(sensor)
         _LOGGER.debug(f"Registered sensor: {sensor.name}")
-
-    async def is_update_stuck(self) -> bool:
-        if self._last_update_start is None:
-            return False
-        elapsed = (datetime.now() - self._last_update_start).total_seconds()
-        return elapsed > self._update_timeout
 
     async def update_data(self):
         """Fetch all data from the inverter asynchronously using bulk request."""
@@ -112,22 +105,6 @@ class DataCollector:
     def last_update(self):
         return self._last_successful_update
 
-    async def update_model(self, model: str):
-        _LOGGER.info(f"Updating inverter model to: {model}")
-        # rebuild client with new model
-        if model in ASCII_MODELS:
-            self._isolar = AsyncAsciiISolar(
-                inverter_ip=self._isolar.inverter_ip,
-                local_ip=self._isolar.local_ip,
-                model=model,
-            )
-        else:
-            self._isolar = AsyncISolar(
-                inverter_ip=self._isolar.inverter_ip,
-                local_ip=self._isolar.local_ip,
-                model=model,
-            )
-
 
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
@@ -142,6 +119,7 @@ class EasunSensor(SensorEntity):
         data_attr: str,
         value_converter=None,
     ):
+        super().__init__()
         self._collector = data_collector
         self._id = sensor_id
         self._name = name
@@ -152,6 +130,12 @@ class EasunSensor(SensorEntity):
         self._state = None
         self._available = True
         self._force_update = True
+
+        # Capture device grouping info
+        isolar = data_collector._isolar
+        self._inverter_ip = isolar.inverter_ip
+        self._model = isolar.model
+
         data_collector.register_sensor(self)
 
     def update_from_collector(self):
@@ -198,6 +182,17 @@ class EasunSensor(SensorEntity):
     def extra_state_attributes(self):
         return {"data_type": self._data_type, "attribute": self._data_attr}
 
+    @property
+    def device_info(self):
+        """Group all Easun sensors under one device in HA."""
+        return {
+            "identifiers": {(DOMAIN, self._inverter_ip)},
+            "name": f"Easun Inverter {self._inverter_ip}",
+            "manufacturer": "Easun",
+            "model": self._model,
+            "configuration_url": f"http://{self._inverter_ip}",
+        }
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -220,7 +215,7 @@ async def async_setup_entry(
         _LOGGER.error("Missing inverter or local IP")
         return
 
-    # choose ASCII or Modbus
+    # Choose ASCII or Modbus client
     if model in ASCII_MODELS:
         client = AsyncAsciiISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
     else:
@@ -228,13 +223,14 @@ async def async_setup_entry(
 
     collector = DataCollector(client)
 
-    # store collector
+    # Store collector for potential reload
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = {"collector": collector}
 
-    # build sensor entities
+    # A small helper for frequency conversion
     def freq_conv(val):
         return val / 100 if val is not None else None
 
+    # Create all sensor entities
     entities = [
         EasunSensor(collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
         EasunSensor(collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
@@ -262,7 +258,7 @@ async def async_setup_entry(
 
     add_entities(entities, True)
 
-    # schedule updates
+    # Schedule periodic updates
     async def _update(now):
         await collector.update_data()
 
