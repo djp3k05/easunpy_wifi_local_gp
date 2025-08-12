@@ -24,10 +24,16 @@ from homeassistant.helpers.event import async_track_time_interval
 from . import DOMAIN
 from easunpy.async_isolar import AsyncISolar
 from easunpy.async_ascii_isolar import AsyncAsciiISolar
+from easunpy.models import MODEL_CONFIGS
 
 _LOGGER = logging.getLogger(__name__)
 
-ASCII_MODELS = {"EASUN_SMW_8K", "EASUN_SMW_11K"}
+# Treat any model that ends with SMW_8K or SMW_11K as ASCII‐protocol
+ASCII_MODELS = {
+    model_key
+    for model_key in MODEL_CONFIGS
+    if model_key.endswith("SMW_8K") or model_key.endswith("SMW_11K")
+}
 
 
 class DataCollector:
@@ -35,47 +41,43 @@ class DataCollector:
 
     def __init__(self, isolar):
         self._isolar = isolar
-        self._data = {}
+        self._data: dict[str, any] = {}
         self._lock = asyncio.Lock()
         self._consecutive_failures = 0
-        self._max_consecutive_failures = 5
-        self._last_update_start = None
-        self._last_successful_update = None
+        self._last_update_start: datetime | None = None
+        self._last_successful_update: datetime | None = None
         self._update_timeout = 30
-        self._sensors = []
+        self._sensors: list[SensorEntity] = []
         _LOGGER.info(f"DataCollector initialized with model: {self._isolar.model}")
 
-    def register_sensor(self, sensor):
-        """Register a sensor to be updated when data is refreshed."""
+    def register_sensor(self, sensor: SensorEntity):
         self._sensors.append(sensor)
         _LOGGER.debug(f"Registered sensor: {sensor.name}")
 
     async def is_update_stuck(self) -> bool:
         if self._last_update_start is None:
             return False
-        time_since_update = (datetime.now() - self._last_update_start).total_seconds()
-        return time_since_update > self._update_timeout
+        elapsed = (datetime.now() - self._last_update_start).total_seconds()
+        return elapsed > self._update_timeout
 
     async def update_data(self):
         """Fetch all data from the inverter asynchronously using bulk request."""
-        if not await self._lock.acquire():
-            _LOGGER.warning("Could not acquire lock for update")
+        if not self._lock.locked():
+            await self._lock.acquire()
+        else:
+            _LOGGER.warning("Update already in progress, skipping")
             return
+
         try:
             update_task = asyncio.create_task(self._do_update())
-            try:
-                await asyncio.wait_for(update_task, timeout=self._update_timeout)
-                for sensor in self._sensors:
-                    sensor.update_from_collector()
-                _LOGGER.debug("Updated all registered sensors")
-            except asyncio.TimeoutError:
-                _LOGGER.error("Update timed out, cancelling task")
-                update_task.cancel()
-                try:
-                    await update_task
-                except asyncio.CancelledError:
-                    _LOGGER.debug("Update task cancelled successfully")
-                raise Exception("Update timed out")
+            await asyncio.wait_for(update_task, timeout=self._update_timeout)
+            for sensor in self._sensors:
+                sensor.update_from_collector()
+            _LOGGER.debug("Updated all registered sensors")
+        except asyncio.TimeoutError:
+            _LOGGER.error("Update timed out; cancelling")
+            update_task.cancel()
+            raise
         finally:
             self._lock.release()
 
@@ -84,25 +86,26 @@ class DataCollector:
             _LOGGER.debug(f"Starting data update using model: {self._isolar.model}")
             battery, pv, grid, output, status = await self._isolar.get_all_data()
             if all(x is None for x in (battery, pv, grid, output, status)):
-                raise Exception("No data received from inverter")
-
-            self._data['battery'] = battery
-            self._data['pv'] = pv
-            self._data['grid'] = grid
-            self._data['output'] = output
-            self._data['system'] = status
+                raise RuntimeError("No data received from inverter")
+            self._data = {
+                "battery": battery,
+                "pv": pv,
+                "grid": grid,
+                "output": output,
+                "system": status,
+            }
             self._consecutive_failures = 0
             self._last_successful_update = datetime.now()
-            _LOGGER.debug("DataCollector updated all data in bulk")
+            _LOGGER.debug("DataCollector updated all data")
         except Exception as e:
             self._consecutive_failures += 1
             delay = min(30, 2 ** self._consecutive_failures)
             _LOGGER.error(f"Error updating data (attempt {self._consecutive_failures}): {e}")
-            _LOGGER.warning(f"Retry in {delay} seconds")
+            _LOGGER.warning(f"Retry in {delay}s")
             await asyncio.sleep(delay)
             raise
 
-    def get_data(self, data_type):
+    def get_data(self, data_type: str):
         return self._data.get(data_type)
 
     @property
@@ -111,67 +114,57 @@ class DataCollector:
 
     async def update_model(self, model: str):
         _LOGGER.info(f"Updating inverter model to: {model}")
-        self._isolar.update_model(model)
+        # rebuild client with new model
+        if model in ASCII_MODELS:
+            self._isolar = AsyncAsciiISolar(
+                inverter_ip=self._isolar.inverter_ip,
+                local_ip=self._isolar.local_ip,
+                model=model,
+            )
+        else:
+            self._isolar = AsyncISolar(
+                inverter_ip=self._isolar.inverter_ip,
+                local_ip=self._isolar.local_ip,
+                model=model,
+            )
 
 
 class EasunSensor(SensorEntity):
     """Representation of an Easun Inverter sensor."""
 
-    def __init__(self, data_collector, id, name, unit, data_type, data_attr, value_converter=None):
-        self._data_collector = data_collector
-        self._id = id
+    def __init__(
+        self,
+        data_collector: DataCollector,
+        sensor_id: str,
+        name: str,
+        unit: str | None,
+        data_type: str,
+        data_attr: str,
+        value_converter=None,
+    ):
+        self._collector = data_collector
+        self._id = sensor_id
         self._name = name
         self._unit = unit
         self._data_type = data_type
         self._data_attr = data_attr
+        self._converter = value_converter
         self._state = None
-        self._value_converter = value_converter
         self._available = True
         self._force_update = True
-        self._data_collector.register_sensor(self)
+        data_collector.register_sensor(self)
 
-    def update_from_collector(self) -> None:
-        try:
-            data = self._data_collector.get_data(self._data_type)
-            if data:
-                if self._data_attr == "inverter_time":
-                    value = data.inverter_time.isoformat() if data.inverter_time else None
-                else:
-                    value = getattr(data, self._data_attr)
-                if self._value_converter:
-                    value = self._value_converter(value)
-                self._state = value
-                self._available = True
-                _LOGGER.debug(f"{self._name} updated: {self._state}")
-            else:
-                _LOGGER.warning(f"No {self._data_type} data available")
-                self._available = False
-        except Exception as e:
-            _LOGGER.error(f"Error updating {self._name}: {e}")
+    def update_from_collector(self):
+        data = self._collector.get_data(self._data_type)
+        if data:
+            val = getattr(data, self._data_attr)
+            if self._converter:
+                val = self._converter(val)
+            self._state = val
+            self._available = True
+        else:
             self._available = False
         self.async_write_ha_state()
-
-    def update(self) -> None:
-        pass
-
-    @property
-    def force_update(self) -> bool:
-        return self._force_update
-
-    @property
-    def extra_state_attributes(self):
-        return {
-            'data_type': self._data_type,
-            'data_attribute': self._data_attr,
-        }
-
-    @property
-    def available(self) -> bool:
-        return self._available
-
-    @property
-    def should_poll(self) -> bool:
-        return False
 
     @property
     def name(self):
@@ -189,15 +182,21 @@ class EasunSensor(SensorEntity):
     def unit_of_measurement(self):
         return self._unit
 
+    @property
+    def available(self):
+        return self._available
 
-class RegisterScanSensor(SensorEntity):
-    """Sensor that shows register scan results."""
-    # (unchanged from original)
+    @property
+    def should_poll(self):
+        return False
 
+    @property
+    def force_update(self):
+        return self._force_update
 
-class DeviceScanSensor(SensorEntity):
-    """Sensor that shows device scan results."""
-    # (unchanged from original)
+    @property
+    def extra_state_attributes(self):
+        return {"data_type": self._data_type, "attribute": self._data_attr}
 
 
 async def async_setup_entry(
@@ -205,44 +204,66 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up the Easun Inverter sensors."""
     _LOGGER.debug("Setting up Easun Inverter sensors")
 
     scan_interval = config_entry.options.get(
-        "scan_interval",
-        config_entry.data.get("scan_interval", 30)
+        "scan_interval", config_entry.data.get("scan_interval", 30)
     )
-
     inverter_ip = config_entry.data.get("inverter_ip")
     local_ip = config_entry.data.get("local_ip")
     model = config_entry.data.get("model")
 
-    _LOGGER.info(f"Setting up sensors with model: {model}")
+    _LOGGER.info(f"Config model: {model}")
 
     if not inverter_ip or not local_ip:
-        _LOGGER.error("Missing inverter IP or local IP in config entry")
+        _LOGGER.error("Missing inverter or local IP")
         return
 
+    # choose ASCII or Modbus
     if model in ASCII_MODELS:
-        isolar = AsyncAsciiISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
+        client = AsyncAsciiISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
     else:
-        isolar = AsyncISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
+        client = AsyncISolar(inverter_ip=inverter_ip, local_ip=local_ip, model=model)
 
-    data_collector = DataCollector(isolar)
+    collector = DataCollector(client)
 
-    # Store the coordinator
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault(config_entry.entry_id, {})
-    hass.data[DOMAIN][config_entry.entry_id]["coordinator"] = data_collector
+    # store collector
+    hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = {"collector": collector}
 
-    # Create sensor entities (battery, PV, grid, output, system) as in your original file
+    # build sensor entities
+    def freq_conv(val):
+        return val / 100 if val is not None else None
+
     entities = [
-        EasunSensor(data_collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
-        # ... all other EasunSensor(...) definitions ...
+        EasunSensor(collector, "battery_voltage", "Battery Voltage", UnitOfElectricPotential.VOLT, "battery", "voltage"),
+        EasunSensor(collector, "battery_current", "Battery Current", UnitOfElectricCurrent.AMPERE, "battery", "current"),
+        EasunSensor(collector, "battery_power", "Battery Power", UnitOfPower.WATT, "battery", "power"),
+        EasunSensor(collector, "battery_soc", "Battery State of Charge", PERCENTAGE, "battery", "soc"),
+        EasunSensor(collector, "battery_temp", "Battery Temperature", UnitOfTemperature.CELSIUS, "battery", "temperature"),
+        EasunSensor(collector, "pv1_voltage", "PV1 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv1_voltage"),
+        EasunSensor(collector, "pv1_current", "PV1 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv1_current"),
+        EasunSensor(collector, "pv1_power", "PV1 Power", UnitOfPower.WATT, "pv", "pv1_power"),
+        EasunSensor(collector, "pv2_voltage", "PV2 Voltage", UnitOfElectricPotential.VOLT, "pv", "pv2_voltage"),
+        EasunSensor(collector, "pv2_current", "PV2 Current", UnitOfElectricCurrent.AMPERE, "pv", "pv2_current"),
+        EasunSensor(collector, "pv2_power", "PV2 Power", UnitOfPower.WATT, "pv", "pv2_power"),
+        EasunSensor(collector, "grid_voltage", "Grid Voltage", UnitOfElectricPotential.VOLT, "grid", "voltage"),
+        EasunSensor(collector, "grid_power", "Grid Power", UnitOfPower.WATT, "grid", "power"),
+        EasunSensor(collector, "grid_frequency", "Grid Frequency", UnitOfFrequency.HERTZ, "grid", "frequency", freq_conv),
+        EasunSensor(collector, "output_voltage", "Output Voltage", UnitOfElectricPotential.VOLT, "output", "voltage"),
+        EasunSensor(collector, "output_current", "Output Current", UnitOfElectricCurrent.AMPERE, "output", "current"),
+        EasunSensor(collector, "output_power", "Output Power", UnitOfPower.WATT, "output", "power"),
+        EasunSensor(collector, "output_apparent", "Output Apparent Power", UnitOfApparentPower.VOLT_AMPERE, "output", "apparent_power"),
+        EasunSensor(collector, "output_load", "Output Load %", PERCENTAGE, "output", "load_percentage"),
+        EasunSensor(collector, "output_frequency", "Output Frequency", UnitOfFrequency.HERTZ, "output", "frequency", freq_conv),
+        EasunSensor(collector, "operating_mode", "Operating Mode", None, "system", "mode_name"),
+        EasunSensor(collector, "inverter_time", "Inverter Time", None, "system", "inverter_time"),
     ]
 
     add_entities(entities, True)
 
+    # schedule updates
     async def _update(now):
-        await data_collector.update_data()
+        await collector.update_data()
 
     async_track_time_interval(hass, _update, timedelta(seconds=scan_interval))
