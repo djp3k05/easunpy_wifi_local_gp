@@ -1,6 +1,6 @@
 # File: custom_components/easun_inverter/sensor.py
 
-"""All Easun sensors grouped under one device, static and dynamic (QPIRI/QPIWS)."""
+"""Support for Easun Inverter sensors, including dynamic QPIRI and QPIWS sensors grouped under one device."""
 from __future__ import annotations
 import asyncio
 import logging
@@ -9,13 +9,13 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import (
+    PERCENTAGE,
     UnitOfElectricPotential,
     UnitOfElectricCurrent,
     UnitOfPower,
     UnitOfApparentPower,
     UnitOfFrequency,
     UnitOfTemperature,
-    PERCENTAGE,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
@@ -29,10 +29,10 @@ from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Route any model ending in SMW_8K/11K to ASCII
-ASCII_MODELS = {m for m in MODEL_CONFIGS if m.endswith("SMW_8K") or m.endswith("SMW_11K")}
+ASCII_MODELS = {
+    m for m in MODEL_CONFIGS if m.endswith("SMW_8K") or m.endswith("SMW_11K")
+}
 
-# Friendly names for QPIRI
 QPIRI_FIELDS = [
     "Grid Rating Voltage",
     "Grid Rating Current",
@@ -63,7 +63,10 @@ QPIRI_FIELDS = [
     "Max Discharging Current",
 ]
 
+
 class DataCollector:
+    """Fetches all data in one go, then fans it out to sensors."""
+
     def __init__(self, client: AsyncISolar | AsyncAsciiISolar) -> None:
         self.client = client
         self._data: dict[str, Any] = {}
@@ -75,7 +78,9 @@ class DataCollector:
         self._sensors.append(sensor)
 
     async def update_data(self) -> None:
+        """One big bulk fetch, then push to each sensor."""
         if self._lock.locked():
+            _LOGGER.debug("Previous update still running, skipping.")
             return
         await self._lock.acquire()
         try:
@@ -87,8 +92,8 @@ class DataCollector:
                 "output": output,
                 "system": status,
             }
-            for s in self._sensors:
-                s.update_from_collector()
+            for sensor in self._sensors:
+                sensor.update_from_collector()
         except Exception as e:
             _LOGGER.error("Failed to fetch Easun data: %s", e)
         finally:
@@ -97,7 +102,10 @@ class DataCollector:
     def get_data(self, key: str) -> Any:
         return self._data.get(key)
 
+
 class EasunSensor(SensorEntity):
+    """Static sensors for battery / pv / grid / output / system."""
+
     def __init__(
         self,
         collector: DataCollector,
@@ -106,7 +114,7 @@ class EasunSensor(SensorEntity):
         unit: str | None,
         data_type: str,
         data_attr: str,
-        conv: callable | None = None,
+        converter: callable | None = None,
     ) -> None:
         super().__init__()
         self.collector = collector
@@ -115,7 +123,7 @@ class EasunSensor(SensorEntity):
         self._unit = unit
         self._data_type = data_type
         self._data_attr = data_attr
-        self._conv = conv
+        self._converter = converter
         self._state: Any = None
         self._available = True
 
@@ -133,12 +141,13 @@ class EasunSensor(SensorEntity):
         data = self.collector.get_data(self._data_type)
         if data is None:
             self._available = False
-            return
-        val = getattr(data, self._data_attr)
-        if self._conv:
-            val = self._conv(val)
-        self._state = val
-        self._available = True
+        else:
+            val = getattr(data, self._data_attr)
+            if self._converter:
+                val = self._converter(val)
+            self._state = val
+            self._available = True
+        self.async_write_ha_state()
 
     @property
     def name(self) -> str:
@@ -165,13 +174,17 @@ class EasunSensor(SensorEntity):
         return False
 
     def update(self) -> None:
+        """No polling; updates are pushed."""
         pass
 
     @property
     def device_info(self) -> dict:
         return self._device_info
 
+
 class InverterInfoSensor(SensorEntity):
+    """One sensor per QPIRI field, numeric‐valued ones get proper units."""
+
     def __init__(self, collector: DataCollector, field: str) -> None:
         super().__init__()
         self.collector = collector
@@ -194,9 +207,10 @@ class InverterInfoSensor(SensorEntity):
         if not status or not status.inverter_info:
             self._state = None
             self._available = False
-            return
-        self._state = status.inverter_info.get(self._field)
-        self._available = True
+        else:
+            self._state = status.inverter_info.get(self._field)
+            self._available = True
+        self.async_write_ha_state()
 
     @property
     def name(self) -> str:
@@ -240,7 +254,10 @@ class InverterInfoSensor(SensorEntity):
     def device_info(self) -> dict:
         return self._device_info
 
+
 class InverterWarningsSensor(SensorEntity):
+    """QPIWS warnings bitmask as a comma-separated string."""
+
     def __init__(self, collector: DataCollector) -> None:
         super().__init__()
         self.collector = collector
@@ -262,9 +279,10 @@ class InverterWarningsSensor(SensorEntity):
         if not status or status.warnings is None:
             self._state = None
             self._available = False
-            return
-        self._state = ", ".join(status.warnings)
-        self._available = True
+        else:
+            self._state = ", ".join(status.warnings)
+            self._available = True
+        self.async_write_ha_state()
 
     @property
     def name(self) -> str:
@@ -293,16 +311,20 @@ class InverterWarningsSensor(SensorEntity):
     def device_info(self) -> dict:
         return self._device_info
 
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     add_entities: AddEntitiesCallback,
 ) -> None:
     _LOGGER.debug("Setting up Easun Inverter sensors")
-    interval = config_entry.options.get("scan_interval", config_entry.data.get("scan_interval", 30))
+
+    scan_interval = config_entry.options.get(
+        "scan_interval", config_entry.data.get("scan_interval", 30)
+    )
     inv_ip = config_entry.data.get("inverter_ip")
     local_ip = config_entry.data.get("local_ip")
-    model  = config_entry.data.get("model")
+    model = config_entry.data.get("model")
 
     if not inv_ip or not local_ip:
         _LOGGER.error("Missing inverter_ip or local_ip")
@@ -343,7 +365,6 @@ async def async_setup_entry(
         EasunSensor(collector, "inverter_time", "Inverter Time", None, "system", "inverter_time"),
     ]
 
-    # dynamic QPIRI/QPIWS for ASCII models
     if model in ASCII_MODELS:
         for f in QPIRI_FIELDS:
             entities.append(InverterInfoSensor(collector, f))
@@ -351,7 +372,11 @@ async def async_setup_entry(
 
     add_entities(entities, True)
 
+    # schedule periodic updates
     async def _update(now):
         await collector.update_data()
 
-    async_track_time_interval(hass, _update, timedelta(seconds=interval))
+    async_track_time_interval(hass, _update, timedelta(seconds=scan_interval))
+
+    # kick off an immediate fetch so the sensors populate right away
+    hass.async_create_task(collector.update_data())
