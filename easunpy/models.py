@@ -53,7 +53,6 @@ class SystemStatus:
     operating_mode: Optional[int]
     mode_name: str
     inverter_time: datetime.datetime
-    # new fields:
     inverter_info: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str]        = field(default_factory=list)
 
@@ -66,6 +65,7 @@ class RegisterConfig:
 
 @dataclass
 class ModelConfig:
+    """Complete configuration for an inverter model."""
     name: str
     register_map: Dict[str, RegisterConfig] = field(default_factory=dict)
 
@@ -85,11 +85,94 @@ class ModelConfig:
             return cfg.processor(value)
         return value * cfg.scale_factor
 
-# … your existing Modbus‐ModelConfig definitions here …
+# --- Modbus‐based model configurations ---
 
-# ASCII‐only (no registers) so we can detect model name
+ISOLAR_SMG_II_11K = ModelConfig(
+    name="ISOLAR_SMG_II_11K",
+    register_map={
+        "operation_mode": RegisterConfig(201),
+        "battery_voltage": RegisterConfig(277, 0.1),
+        "battery_current": RegisterConfig(278, 0.1),
+        "battery_power": RegisterConfig(279),
+        "battery_soc": RegisterConfig(280),
+        "battery_temperature": RegisterConfig(281),
+        "pv_total_power": RegisterConfig(302),
+        "pv_charging_power": RegisterConfig(303),
+        "pv_charging_current": RegisterConfig(304, 0.1),
+        "pv_temperature": RegisterConfig(305),
+        "pv1_voltage": RegisterConfig(351, 0.1),
+        "pv1_current": RegisterConfig(352, 0.1),
+        "pv1_power": RegisterConfig(353),
+        "pv2_voltage": RegisterConfig(389, 0.1),
+        "pv2_current": RegisterConfig(390, 0.1),
+        "pv2_power": RegisterConfig(391),
+        "grid_voltage": RegisterConfig(338, 0.1),
+        "grid_current": RegisterConfig(339, 0.1),
+        "grid_power": RegisterConfig(340),
+        "grid_frequency": RegisterConfig(607),
+        "output_voltage": RegisterConfig(346, 0.1),
+        "output_current": RegisterConfig(347, 0.1),
+        "output_power": RegisterConfig(348),
+        "output_apparent_power": RegisterConfig(349),
+        "output_load_percentage": RegisterConfig(350),
+        "output_frequency": RegisterConfig(607),
+        "time_register_0": RegisterConfig(696, processor=int),
+        "time_register_1": RegisterConfig(697, processor=int),
+        "time_register_2": RegisterConfig(698, processor=int),
+        "time_register_3": RegisterConfig(699, processor=int),
+        "time_register_4": RegisterConfig(700, processor=int),
+        "time_register_5": RegisterConfig(701, processor=int),
+        "pv_energy_today": RegisterConfig(702, 0.01),
+        "pv_energy_total": RegisterConfig(703, 0.01),
+    }
+)
+
+ISOLAR_SMG_II_6K = ModelConfig(
+    name="ISOLAR_SMG_II_6K",
+    register_map={
+        "operation_mode": RegisterConfig(201),
+        "battery_voltage": RegisterConfig(215, 0.1),
+        "battery_current": RegisterConfig(216, 0.1),
+        "battery_power": RegisterConfig(217),
+        "battery_soc": RegisterConfig(229),
+        "battery_temperature": RegisterConfig(226),
+        "pv_total_power": RegisterConfig(223),
+        "pv_charging_power": RegisterConfig(224),
+        "pv_charging_current": RegisterConfig(234, 0.1),
+        "pv_temperature": RegisterConfig(227),
+        "pv1_voltage": RegisterConfig(219, 0.1),
+        "pv1_current": RegisterConfig(220, 0.1),
+        "pv1_power": RegisterConfig(223),
+        "pv2_voltage": RegisterConfig(0),
+        "pv2_current": RegisterConfig(0),
+        "pv2_power": RegisterConfig(0),
+        "grid_voltage": RegisterConfig(202, 0.1),
+        "grid_current": RegisterConfig(0),
+        "grid_power": RegisterConfig(204),
+        "grid_frequency": RegisterConfig(203),
+        "output_voltage": RegisterConfig(210, 0.1),
+        "output_current": RegisterConfig(211, 0.1),
+        "output_power": RegisterConfig(213),
+        "output_apparent_power": RegisterConfig(214),
+        "output_load_percentage": RegisterConfig(225, 0.01),
+        "output_frequency": RegisterConfig(212),
+        "time_register_0": RegisterConfig(696, processor=int),
+        "time_register_1": RegisterConfig(697, processor=int),
+        "time_register_2": RegisterConfig(698, processor=int),
+        "time_register_3": RegisterConfig(699, processor=int),
+        "time_register_4": RegisterConfig(700, processor=int),
+        "time_register_5": RegisterConfig(701, processor=int),
+        "pv_energy_today": RegisterConfig(0),
+        "pv_energy_total": RegisterConfig(0),
+    }
+)
+
+# --- ASCII‐only model entries ---
+
 EASUN_SMW_8K  = ModelConfig(name="EASUN_SMW_8K",  register_map={})
 EASUN_SMW_11K = ModelConfig(name="EASUN_SMW_11K", register_map={})
+
+# --- All supported models ---
 
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
     "ISOLAR_SMG_II_11K": ISOLAR_SMG_II_11K,
