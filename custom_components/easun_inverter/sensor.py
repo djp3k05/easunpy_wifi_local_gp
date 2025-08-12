@@ -319,12 +319,19 @@ async def async_setup_entry(
 ) -> None:
     _LOGGER.debug("Setting up Easun Inverter sensors")
 
+    # → Use any updated options, falling back to the original data
     scan_interval = config_entry.options.get(
         "scan_interval", config_entry.data.get("scan_interval", 30)
     )
-    inv_ip = config_entry.data.get("inverter_ip")
-    local_ip = config_entry.data.get("local_ip")
-    model = config_entry.data.get("model")
+    inv_ip = config_entry.options.get(
+        "inverter_ip", config_entry.data.get("inverter_ip")
+    )
+    local_ip = config_entry.options.get(
+        "local_ip", config_entry.data.get("local_ip")
+    )
+    model = config_entry.options.get(
+        "model", config_entry.data.get("model")
+    )
 
     if not inv_ip or not local_ip:
         _LOGGER.error("Missing inverter_ip or local_ip")
