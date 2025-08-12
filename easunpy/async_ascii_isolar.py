@@ -51,11 +51,11 @@ class AsyncAsciiISolar:
         data = cmd_bytes + bytes([high, low, 0x0D])
         length = len(data) + 2
         header = bytes([
-            (trans_id >> 8) & 0xFF, trans_id & 0xFF,  # Trans ID
-            0x00, 0x01,                                # Protocol ID
-            (length >> 8) & 0xFF, length & 0xFF,      # Length
-            0xFF,                                      # Unit ID
-            0x04                                       # Function code
+            (trans_id >> 8) & 0xFF, trans_id & 0xFF,
+            0x00, 0x01,
+            (length >> 8) & 0xFF, length & 0xFF,
+            0xFF,
+            0x04
         ])
         return header + data
 
@@ -98,10 +98,21 @@ class AsyncAsciiISolar:
         self._writer.write(packet)
         await self._writer.drain()
 
+        # read Modbus‐style header
         header = await asyncio.wait_for(self._reader.readexactly(6), timeout=5)
         length = int.from_bytes(header[4:6], "big")
         payload = await asyncio.wait_for(self._reader.readexactly(length), timeout=5)
+
+        # decode ASCII, drop CRC (2 bytes) + CR
         raw = payload[:-3].decode("ascii", errors="ignore")
+
+        # strip any leading garbage up to the first '('
+        idx = raw.find('(')
+        if idx != -1:
+            raw = raw[idx:]
+        raw = raw.strip()
+
+        self.logger.debug(f"Raw response for {command}: {raw!r}")
         return raw
 
     def _parse_qpigs(self, raw: str) -> dict:
@@ -147,12 +158,12 @@ class AsyncAsciiISolar:
         self
     ) -> tuple[BatteryData, PVData, GridData, OutputData, SystemStatus]:
         """Poll all ASCII commands and assemble dataclasses."""
-        r = {}
+        responses = {}
         for cmd in self.commands:
-            raw = await self._send_command(cmd)
-            r[cmd] = raw
-            await asyncio.sleep(0.5)
+            responses[cmd] = await self._send_command(cmd)
+            await asyncio.sleep(0.3)
 
+        # close connection
         if self._writer:
             self._writer.close()
             await self._writer.wait_closed()
@@ -160,9 +171,9 @@ class AsyncAsciiISolar:
             self._server.close()
             await self._server.wait_closed()
 
-        p1 = self._parse_qpigs(r["QPIGS"])
-        p2 = self._parse_qpigs2(r["QPIGS2"])
-        mode_name = self._parse_qmod(r["QMOD"])
+        p1 = self._parse_qpigs(responses["QPIGS"])
+        p2 = self._parse_qpigs2(responses["QPIGS2"])
+        mode_name = self._parse_qmod(responses["QMOD"])
 
         battery = BatteryData(
             voltage=p1["battery_voltage"],
